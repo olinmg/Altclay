@@ -359,7 +359,6 @@ export default function ToolPage() {
       });
     }
     hydratedRef.current = true;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /* ---- session auto-save (debounced) ---- */
