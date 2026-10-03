@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:h2": "node scripts/h2-proxy.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint app/ lib/"

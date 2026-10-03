@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { JWT } from "google-auth-library";
+import { enter as enterInFlight, exit as exitInFlight } from "@/lib/inflightCounter";
 
 async function getVertexAccessToken(serviceAccountJson: string): Promise<{ token: string; projectId: string }> {
   const creds = JSON.parse(serviceAccountJson);
@@ -42,6 +43,10 @@ function extractJSON(text: string): Record<string, string> {
 }
 
 export async function POST(req: NextRequest) {
+  // Track TRUE server-side concurrency (see lib/inflightCounter). The UI polls
+  // /api/enrich-stats to display this — the only reliable measure of how many
+  // requests actually reach the backend in parallel.
+  enterInFlight();
   try {
     const { provider, apiKey, modelId, prompt, useWebSearch = true } = await req.json();
 
@@ -166,6 +171,68 @@ export async function POST(req: NextRequest) {
         inputTokens: openaiData.usage?.input_tokens || 0,
         outputTokens: openaiData.usage?.output_tokens || 0,
       });
+    } else if (provider === "azure") {
+      // Azure OpenAI v1 API surface — OpenAI-compatible Responses API.
+      // The `apiKey` field carries a JSON blob { endpoint, deployment, key }
+      // (same overload pattern used by the vertex provider). `model` in the
+      // request body is the Azure *deployment* name, not a model id.
+      let endpoint: string, deployment: string, key: string;
+      try {
+        ({ endpoint, deployment, key } = JSON.parse(apiKey));
+      } catch {
+        return NextResponse.json({ error: "Invalid Azure configuration" }, { status: 400 });
+      }
+      if (!endpoint || !deployment || !key) {
+        return NextResponse.json({ error: "Azure endpoint, deployment, and key are required" }, { status: 400 });
+      }
+      const base = endpoint.replace(/\/+$/, "");
+      // Accept either a full Responses URL (any Azure host / api-version, pasted
+      // verbatim from the portal) or a bare resource URL (append the v1 path).
+      const url = /\/responses(\?|$)/.test(base) ? base : `${base}/openai/v1/responses`;
+      const tools = useWebSearch ? [{ type: "web_search" }] : [];
+      const azureRes = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "api-key": key },
+        body: JSON.stringify({
+          model: deployment,
+          input: [{ role: "user", content: prompt }],
+          ...(tools.length > 0 ? { tools } : {}),
+        }),
+      });
+
+      if (!azureRes.ok) {
+        const errBody = await azureRes.text();
+        // Surface rate limits as a structured 429 with Azure's Retry-After hint
+        // so the client can back off precisely and show a countdown.
+        if (azureRes.status === 429) {
+          const header = azureRes.headers.get("retry-after");
+          const retryAfter = header && !Number.isNaN(Number(header)) ? Number(header) : undefined;
+          return NextResponse.json(
+            { error: errBody || "Azure rate limit exceeded", rateLimited: true, retryAfter },
+            { status: 429 }
+          );
+        }
+        throw new Error(errBody || `Azure OpenAI error: ${azureRes.status}`);
+      }
+
+      const azureData = await azureRes.json();
+      let text = "";
+      if (Array.isArray(azureData.output)) {
+        for (const item of azureData.output) {
+          if (item.type === "message" && Array.isArray(item.content)) {
+            for (const block of item.content) {
+              if (block.type === "output_text") text += block.text;
+            }
+          }
+        }
+      }
+
+      const data = extractJSON(text);
+      return NextResponse.json({
+        data,
+        inputTokens: azureData.usage?.input_tokens || 0,
+        outputTokens: azureData.usage?.output_tokens || 0,
+      });
     } else if (provider === "vertex") {
       const { token, projectId } = await getVertexAccessToken(apiKey);
       const url = getVertexEndpoint(modelId, projectId);
@@ -206,5 +273,7 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     const message = err instanceof Error ? err.message : "Enrichment failed";
     return NextResponse.json({ error: message }, { status: 500 });
+  } finally {
+    exitInFlight();
   }
 }

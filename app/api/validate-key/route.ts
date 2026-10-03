@@ -54,6 +54,37 @@ export async function POST(req: NextRequest) {
         throw new Error(`${openaiRes.status} ${errText}`);
       }
       return NextResponse.json({ valid: true });
+    } else if (provider === "azure") {
+      const { endpoint, deployment, key } = JSON.parse(apiKey);
+      if (!endpoint || !deployment || !key) {
+        return NextResponse.json({ valid: false, error: "Azure endpoint, deployment, and key are required" });
+      }
+      const base = endpoint.replace(/\/+$/, "");
+      const url = /\/responses(\?|$)/.test(base) ? base : `${base}/openai/v1/responses`;
+      const azureRes = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "api-key": key },
+        body: JSON.stringify({
+          model: deployment,
+          input: [{ role: "user", content: "Hi" }],
+          max_output_tokens: 16,
+        }),
+      });
+      if (!azureRes.ok) {
+        const errText = await azureRes.text();
+        const status = azureRes.status;
+        // 401/403 with an api-key header genuinely means a bad key.
+        if (status === 401 || status === 403) {
+          return NextResponse.json({ valid: false, error: `Azure rejected the API key (${status}). Check the key belongs to this resource.` });
+        }
+        // 404 almost always means a wrong deployment name or endpoint path — NOT the key.
+        if (status === 404) {
+          return NextResponse.json({ valid: false, error: `Azure returned 404 — the deployment name or endpoint path is likely wrong (not the key). Azure said: ${errText.slice(0, 300)}` });
+        }
+        // Everything else (400 bad api-version, tool unsupported, etc.) — show it verbatim.
+        return NextResponse.json({ valid: false, error: `Azure error ${status}: ${errText.slice(0, 300)}` });
+      }
+      return NextResponse.json({ valid: true });
     } else if (provider === "vertex") {
       const creds = JSON.parse(apiKey);
       const client = new JWT({

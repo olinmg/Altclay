@@ -16,6 +16,12 @@
 # misc
 .DS_Store
 *.pem
+*.key
+*.p12
+*.pfx
+/.dev-certs
+/.claude/settings.local.json
+/altclay.zip
 
 # debug
 npm-debug.log*
@@ -23,7 +29,9 @@ yarn-debug.log*
 yarn-error.log*
 
 # env files
-.env*.local
+.env
+.env.*
+!.env.example
 
 # vercel
 .vercel

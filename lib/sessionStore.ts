@@ -9,7 +9,7 @@ import type {
 // localStorage so the session survives BOTH a reload and a full tab close.
 // NOTE (privacy): the API key is NEVER persisted — it stays in React state only.
 const SESSION_KEY = "openclay_session_v1";
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export interface SavedSession {
   version: number;
@@ -20,6 +20,10 @@ export interface SavedSession {
   outputColumns: OutputColumn[];
   provider: Provider;
   modelId: ModelId;
+  // Azure config (endpoint + deployment name) is safe to persist — NOT secret.
+  // The Azure API key, like every provider's key, is NEVER saved.
+  azureEndpoint: string;
+  azureDeployment: string;
   useWebSearch: boolean;
   advancedMode: boolean;
   customPrompt: string;

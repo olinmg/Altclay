@@ -1,4 +1,4 @@
-export type Provider = "anthropic" | "gemini" | "grok" | "openai" | "vertex";
+export type Provider = "anthropic" | "gemini" | "grok" | "openai" | "vertex" | "azure";
 
 export type AnthropicModelId =
   | "claude-haiku-4-5-20251001"

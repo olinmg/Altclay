@@ -122,6 +122,7 @@ export function calculateCostEstimate(
       searchCostPerRow,
     };
   } else {
+    // openai + azure — Azure hosts the same models at the same per-token rates
     const model = OPENAI_MODELS[modelId as OpenAIModelId];
     if (!model) throw new Error(`Unknown model: ${modelId}`);
 

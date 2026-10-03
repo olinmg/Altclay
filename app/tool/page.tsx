@@ -25,8 +25,9 @@ import {
   GROK_PRICING_URL,
   OPENAI_PRICING_URL,
   VERTEX_PRICING_URL,
+  AZURE_PRICING_URL,
 } from "@/lib/pricing";
-import { buildPrompt } from "@/lib/promptTemplates";
+import { buildPrompt, buildPromptTemplate } from "@/lib/promptTemplates";
 import { estimateInputTokensPerRow, estimateOutputTokensPerRow, calculateCostRange, calculateCostFromActualTokens } from "@/lib/costEstimator";
 import { parseFile, exportToFile } from "@/lib/fileParser";
 import { enrichRowAnthropic } from "@/lib/anthropic";
@@ -35,6 +36,7 @@ import { enrichRowGrok } from "@/lib/grok";
 import { enrichRowOpenAI } from "@/lib/openai";
 import { saveSession, loadSession, clearSession, hasMeaningfulWork, timeAgo, type SavedSession } from "@/lib/sessionStore";
 import { enrichRowVertex } from "@/lib/vertex";
+import { enrichRowAzure, RateLimitError } from "@/lib/azure";
 
 /* ------------------------------------------------------------------ */
 /*  Light-themed Helpers                                                */
@@ -115,6 +117,16 @@ const SMART_COLUMN_PATTERNS = [
   /^(product|app|service|tool)[\s_-]*(name)?$/i,
 ];
 
+/** Human-friendly ETA: "45s", "3m 20s", "1h 5m". */
+function formatEta(totalSeconds: number): string {
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m ${s}s`;
+}
+
 function detectSmartColumns(columns: string[]): string[] {
   const matches = columns.filter((col) =>
     SMART_COLUMN_PATTERNS.some((pattern) => pattern.test(col.trim()))
@@ -171,6 +183,10 @@ export default function ToolPage() {
   const [modelId, setModelId] = useState<ModelId>("gemini-3.1-pro-preview");
 
   const [apiKey, setApiKey] = useState("");
+  // Azure OpenAI needs an endpoint + deployment name alongside the key.
+  // These two are safe to persist (not secret); the key is never saved.
+  const [azureEndpoint, setAzureEndpoint] = useState("");
+  const [azureDeployment, setAzureDeployment] = useState("");
   const [keyValid, setKeyValid] = useState(false);
   const [validating, setValidating] = useState(false);
   const [keyError, setKeyError] = useState("");
@@ -188,6 +204,49 @@ export default function ToolPage() {
   const pauseRef = useRef(false);
   const stopRef = useRef(false);
 
+  // Rate-limit backoff: timestamp (ms) when the soonest paused request resumes.
+  const [rateLimitResetAt, setRateLimitResetAt] = useState<number | null>(null);
+  const [rlCountdown, setRlCountdown] = useState(0); // seconds remaining, for display
+  // Shared gate across all workers: no request fires until Date.now() passes this.
+  // A 429 from ANY worker pushes this out, pausing the whole fleet together.
+  const rateLimitGateRef = useRef(0);
+  // Shared, adaptive backoff (ms). Grows on every 429, decays on success — so the
+  // fleet converges to the deployment's real throughput instead of resetting to
+  // the floor on each new row. Persists across rows and workers.
+  const rlBackoffRef = useRef(0);
+  const RL_BACKOFF_FLOOR = 500;   // first backoff step
+  const RL_BACKOFF_CAP = 60_000;  // never wait longer than this between tries
+
+  // ETA: rolling window of the last N per-request latencies (ms). Averaged and
+  // extrapolated over the remaining rows (÷ worker count) to estimate time left.
+  const reqDurationsRef = useRef<number[]>([]);
+  const ETA_WINDOW = 40;
+  // Concurrency: how many rows are enriched in parallel. The slider edits a DRAFT
+  // value; nothing changes until the user presses "Apply". On apply we commit to
+  // `appliedConcurrency`, whose ref mirror the in-flight worker pool reads live —
+  // so the running batch grows/shrinks to match without a restart (see runFull()).
+  const MAX_CONCURRENCY = 25;
+  const [concurrency, setConcurrency] = useState(5);          // draft (slider position)
+  const [appliedConcurrency, setAppliedConcurrency] = useState(5); // committed value
+  const concurrencyRef = useRef(5);
+  useEffect(() => { concurrencyRef.current = appliedConcurrency; }, [appliedConcurrency]);
+  // Live count of workers actually running right now — surfaced in the UI so the
+  // chosen concurrency is observably in effect (e.g. distinguishes "17 workers,
+  // all throttled by 429" from "actually running fewer than requested").
+  const [liveWorkers, setLiveWorkers] = useState(0);
+  // TRUE server-side concurrency, polled from /api/enrich-stats during a run.
+  // This is the reliable measure: a client-side counter can't distinguish a fetch
+  // on the wire from one queued in the browser's per-host connection pool (the ~6
+  // HTTP/1.1 cap), so it over-reports. The server only sees a request once the
+  // browser actually sends it, so `serverInFlight`/`serverPeak` reflect the real
+  // parallelism reaching the backend.
+  const [serverInFlight, setServerInFlight] = useState(0);
+  const [serverPeak, setServerPeak] = useState(0);
+  const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
+  // Suggested Azure TPM (tokens/min) to sustain this workload without throttling —
+  // derived from actual token usage × achievable request rate during the run.
+  const [tpmEstimate, setTpmEstimate] = useState<number | null>(null);
+
   const [useWebSearch, setUseWebSearch] = useState(true);
   const [realCostEstimate, setRealCostEstimate] = useState<import("@/lib/types").CostEstimate | null>(null);
 
@@ -202,14 +261,23 @@ export default function ToolPage() {
   // Expanded table view
   const [expandedView, setExpandedView] = useState<"test" | "full" | null>(null);
 
+  // Collapsible sidebar cost cards — when folded, only the total is shown.
+  const [estimateCollapsed, setEstimateCollapsed] = useState(false);
+  const [liveCostCollapsed, setLiveCostCollapsed] = useState(false);
+
   /* ---- derived ---- */
-  const models = provider === "anthropic" ? Object.entries(ANTHROPIC_MODELS) : provider === "grok" ? Object.entries(GROK_MODELS) : provider === "openai" ? Object.entries(OPENAI_MODELS) : Object.entries(GEMINI_MODELS);
+  const models = provider === "anthropic" ? Object.entries(ANTHROPIC_MODELS) : provider === "grok" ? Object.entries(GROK_MODELS) : provider === "openai" || provider === "azure" ? Object.entries(OPENAI_MODELS) : Object.entries(GEMINI_MODELS);
   const describeReady = file && enrichmentDescription.trim().length > 0 && inputColumns.length > 0 && outputColumns.length > 0;
-  const generatedPrompt = file && inputColumns.length > 0 && outputColumns.length > 0 ? buildPrompt(inputColumns, file.rows[0], outputColumns, enrichmentDescription, undefined, useWebSearch) : "";
+  // Editable-prompt seed: a TEMPLATE with {column} placeholders — NOT row 0's baked
+  // values. buildPrompt() substitutes each row's real data into these at run time.
+  const generatedPrompt = file && inputColumns.length > 0 && outputColumns.length > 0 ? buildPromptTemplate(inputColumns, outputColumns, enrichmentDescription, useWebSearch) : "";
   const configReady = describeReady && (!advancedMode || customPrompt.trim().length > 0);
   const runReady = configReady && keyValid;
   const hasPartialRun = fullResults.length > 0 && !fullRunning && !fullDone;
   const remainingRows = file ? Math.max(0, file.totalRows - fullResults.filter((r) => r.success).length) : 0;
+  // Successful rows where the model returned "N/A" for at least one output value —
+  // the row ran fine but some value couldn't be determined. Not a failure.
+  const fullPartial = fullResults.filter((r) => r.success && Object.values(r.data).some((v) => v === "N/A")).length;
 
   const costRange = useMemo(() => {
     if (!file || inputColumns.length === 0 || outputColumns.length === 0) return null;
@@ -218,6 +286,31 @@ export default function ToolPage() {
     const out = estimateOutputTokensPerRow(outputColumns);
     return calculateCostRange(file.totalRows, inp, out, provider, modelId, useWebSearch);
   }, [file, inputColumns, outputColumns, enrichmentDescription, customPrompt, advancedMode, provider, modelId, useWebSearch]);
+
+  // Live cost actually INCURRED so far — from the real token counts of every
+  // successful call that ran (test rows + full run; both cost real money). Unlike
+  // the projected estimate, this only ever counts work that has already happened.
+  const liveCost = useMemo(() => {
+    if (!file) return null;
+    const runRows = [...testResults, ...fullResults].filter(
+      (r) => r.success && r.inputTokens != null && r.outputTokens != null
+    );
+    if (runRows.length === 0) return null;
+    const sumIn = runRows.reduce((s, r) => s + (r.inputTokens || 0), 0);
+    const sumOut = runRows.reduce((s, r) => s + (r.outputTokens || 0), 0);
+    const count = runRows.length;
+    // Feed AVERAGE tokens × the real row count back into the estimator so the
+    // per-token costs equal the true sums and search fees are charged per row run.
+    const est = calculateCostFromActualTokens(
+      count,
+      Math.round(sumIn / count),
+      Math.round(sumOut / count),
+      provider,
+      modelId,
+      useWebSearch
+    );
+    return { ...est, rowsRun: count, totalInputTokens: sumIn, totalOutputTokens: sumOut };
+  }, [file, testResults, fullResults, provider, modelId, useWebSearch]);
 
   const smartColumns = useMemo(() => {
     if (!file) return { recommended: [] as string[], other: [] as string[] };
@@ -247,6 +340,8 @@ export default function ToolPage() {
       setColumnsAutoSelected(true); // don't re-run auto-select over restored choices
       setProvider(s.provider);
       setModelId(s.modelId);
+      setAzureEndpoint(s.azureEndpoint || "");
+      setAzureDeployment(s.azureDeployment || "");
       setUseWebSearch(s.useWebSearch);
       setAdvancedMode(s.advancedMode);
       setCustomPrompt(s.customPrompt);
@@ -278,6 +373,8 @@ export default function ToolPage() {
         outputColumns,
         provider,
         modelId,
+        azureEndpoint,
+        azureDeployment,
         useWebSearch,
         advancedMode,
         customPrompt,
@@ -291,7 +388,76 @@ export default function ToolPage() {
       setSaveWarning(res.quotaExceeded === true);
     }, 600);
     return () => clearTimeout(handle);
-  }, [file, enrichmentDescription, inputColumns, outputColumns, provider, modelId, useWebSearch, advancedMode, customPrompt, testResults, testDone, fullResults, fullCompleted, fullFailed, fullDone]);
+  }, [file, enrichmentDescription, inputColumns, outputColumns, provider, modelId, azureEndpoint, azureDeployment, useWebSearch, advancedMode, customPrompt, testResults, testDone, fullResults, fullCompleted, fullFailed, fullDone]);
+
+  /* ---- rate-limit countdown ticker ---- */
+  useEffect(() => {
+    if (rateLimitResetAt == null) { setRlCountdown(0); return; }
+    const tick = () => {
+      const secs = Math.max(0, Math.ceil((rateLimitResetAt - Date.now()) / 1000));
+      setRlCountdown(secs);
+      if (secs === 0) setRateLimitResetAt(null); // window elapsed — clear the banner
+    };
+    tick();
+    const id = setInterval(tick, 250);
+    return () => clearInterval(id);
+  }, [rateLimitResetAt]);
+
+  /* ---- ETA ticker ----
+     Recompute the estimate reactively while a run is active: on an interval AND
+     immediately whenever the applied concurrency or progress changes. Computing
+     it only on row completion made it look frozen after a concurrency change (the
+     divisor updated, but nothing re-ran the math until the next row finished). */
+  useEffect(() => {
+    if (!fullRunning || !file) return;
+    const recompute = () => {
+      const durations = reqDurationsRef.current;
+      const avgMs = durations.length > 0 ? durations.reduce((s, d) => s + d, 0) / durations.length : 0;
+      if (avgMs <= 0) return;
+      const remaining = file.rows.length - (fullCompleted + fullFailed);
+      // ETA reflects the ACTUAL running rate (the applied worker count).
+      const etaWorkers = Math.max(1, appliedConcurrency);
+      setEtaSeconds(remaining <= 0 ? 0 : Math.ceil((remaining / etaWorkers) * avgMs / 1000));
+      // Suggested Azure TPM previews the DRAFT slider value (`concurrency`), so the
+      // number moves as the user drags the slider — before they press Apply — to
+      // help them size their deployment's limit for the count they're considering.
+      // TPM = avg tokens/request × requests/min sustainable = workers × (60s / avgMs).
+      const tpmWorkers = Math.max(1, concurrency);
+      const enriched = fullResults.filter((x) => x?.success && x.inputTokens && x.outputTokens);
+      if (enriched.length >= 3) {
+        const avgIn = enriched.reduce((s, x) => s + (x.inputTokens || 0), 0) / enriched.length;
+        const avgOut = enriched.reduce((s, x) => s + (x.outputTokens || 0), 0) / enriched.length;
+        const reqPerMin = (tpmWorkers * 60_000) / avgMs;
+        setTpmEstimate(Math.ceil(((avgIn + avgOut) * reqPerMin) / 1000) * 1000); // round to 1k
+      }
+    };
+    recompute();
+    const id = setInterval(recompute, 1000);
+    return () => clearInterval(id);
+  }, [fullRunning, file, appliedConcurrency, concurrency, fullCompleted, fullFailed, fullResults]);
+
+  /* ---- server-side concurrency poller ----
+     Poll /api/enrich-stats while a run is active to show the TRUE number of
+     requests the backend is handling in parallel (and the peak). This is the
+     honest measure of concurrency — the client can't see it because browser-
+     queued fetches look "in flight" to JS even when only ~6 are on the wire. */
+  useEffect(() => {
+    if (!fullRunning) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch("/api/enrich-stats");
+        if (!res.ok) return;
+        const s = await res.json();
+        if (cancelled) return;
+        setServerInFlight(s.inFlight ?? 0);
+        setServerPeak(s.peak ?? 0);
+      } catch { /* ignore transient errors */ }
+    };
+    poll();
+    const id = setInterval(poll, 500);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [fullRunning]);
 
   /* ---- close expanded view on Escape ---- */
   useEffect(() => {
@@ -324,12 +490,29 @@ export default function ToolPage() {
     setRealCostEstimate(null); setAdvancedMode(false); setCustomPrompt("");
   };
 
+  // Reset just the run: clear preview + full results but keep the file, columns,
+  // description, provider, key, and all settings — back to the pre-preview state.
+  const resetRun = () => {
+    setTestResults([]); setTestDone(false);
+    setFullResults([]); setFullCompleted(0); setFullFailed(0); setFullDone(false);
+    setFullPaused(false); setRealCostEstimate(null); setRateLimitResetAt(null);
+    pauseRef.current = false; stopRef.current = false;
+  };
+
   /* ---- handlers ---- */
+  // Azure carries its endpoint + deployment + key as a JSON blob in the apiKey field.
+  const azureConfigJSON = () =>
+    JSON.stringify({ endpoint: azureEndpoint.trim(), deployment: azureDeployment.trim(), key: apiKey.trim() });
+
   const validateKey = async () => {
     if (!apiKey.trim()) { setKeyError("Please enter an API key"); return; }
+    if (provider === "azure" && (!azureEndpoint.trim() || !azureDeployment.trim())) {
+      setKeyError("Please enter your Azure endpoint and deployment name"); return;
+    }
     setValidating(true); setKeyError(""); setKeyWarning("");
     try {
-      const res = await fetch("/api/validate-key", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, apiKey: apiKey.trim() }) });
+      const keyPayload = provider === "azure" ? azureConfigJSON() : apiKey.trim();
+      const res = await fetch("/api/validate-key", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider, apiKey: keyPayload }) });
       const data = await res.json();
       if (data.valid) { setKeyValid(true); if (data.warning) setKeyWarning(data.warning); } else { setKeyError(data.error || "Invalid API key"); }
     } catch { setKeyError("Validation failed. Try again."); }
@@ -378,8 +561,18 @@ export default function ToolPage() {
 
   const enrichSingleRow = useCallback(async (row: Record<string, string>, index: number): Promise<EnrichmentResult> => {
     const prompt = buildPrompt(inputColumns, row, outputColumns, enrichmentDescription, advancedMode ? customPrompt : undefined, useWebSearch);
-    for (let attempt = 0; attempt < 3; attempt++) {
+    let attempt = 0;        // generic (non-rate-limit) failures — these can still fail
+    const MAX_ATTEMPTS = 3;
+    while (true) {
+      if (stopRef.current) return { rowIndex: index, success: false, data: {}, error: "Stopped" };
+      // Respect the shared rate-limit gate: if another worker hit a 429, hold here
+      // until its cooldown passes so all workers resume together (no lockstep re-trip).
+      while (rateLimitGateRef.current > Date.now()) {
+        if (stopRef.current) return { rowIndex: index, success: false, data: {}, error: "Stopped" };
+        await new Promise((r) => setTimeout(r, Math.min(250, rateLimitGateRef.current - Date.now())));
+      }
       try {
+        const startedAt = Date.now();
         const result = provider === "anthropic"
           ? await enrichRowAnthropic(apiKey, modelId as AnthropicModelId, prompt, useWebSearch)
           : provider === "grok"
@@ -388,19 +581,52 @@ export default function ToolPage() {
           ? await enrichRowOpenAI(apiKey, modelId as OpenAIModelId, prompt, useWebSearch)
           : provider === "vertex"
           ? await enrichRowVertex(apiKey, modelId as GeminiModelId, prompt, useWebSearch)
+          : provider === "azure"
+          ? await enrichRowAzure({ endpoint: azureEndpoint.trim(), deployment: azureDeployment.trim(), key: apiKey.trim() }, modelId as OpenAIModelId, prompt, useWebSearch)
           : await enrichRowGemini(apiKey, modelId as GeminiModelId, prompt, useWebSearch);
+        // Record latency in the rolling window (drop the oldest) for the ETA estimate.
+        const durations = reqDurationsRef.current;
+        durations.push(Date.now() - startedAt);
+        if (durations.length > ETA_WINDOW) durations.shift();
+        // Success — gently decay the shared backoff so the fleet can speed back up
+        // toward the deployment's real throughput after a burst of 429s.
+        rlBackoffRef.current = Math.floor(rlBackoffRef.current / 2);
+        if (rlBackoffRef.current < RL_BACKOFF_FLOOR) rlBackoffRef.current = 0;
         return { rowIndex: index, success: true, data: result.data, inputTokens: result.inputTokens, outputTokens: result.outputTokens };
       } catch (err) {
-        if (attempt === 2) return { rowIndex: index, success: false, data: {}, error: (err as Error).message };
+        if (err instanceof RateLimitError) {
+          // Rate limits are NEVER terminal: a throttled row queues and retries
+          // indefinitely until it succeeds (or the user Stops). Nothing fails on 429.
+          // Grow the SHARED, persistent backoff (doubling, floor 0.5s, cap 60s) so the
+          // whole fleet converges to the real throughput instead of resetting per-row.
+          const grown = rlBackoffRef.current > 0
+            ? Math.min(RL_BACKOFF_CAP, rlBackoffRef.current * 2)
+            : RL_BACKOFF_FLOOR;
+          rlBackoffRef.current = grown;
+          // Honor Azure's Retry-After header when it's longer than our backoff.
+          const waitMs = Math.max(
+            err.retryAfter != null ? err.retryAfter * 1000 : 0,
+            grown
+          ) + Math.floor(Math.random() * 500); // jitter so workers don't re-trip in lockstep
+          // Extend the SHARED gate so every worker pauses together, and surface the
+          // resume time to the UI countdown. Never pull the gate earlier than it is.
+          const target = Date.now() + waitMs;
+          rateLimitGateRef.current = Math.max(rateLimitGateRef.current, target);
+          setRateLimitResetAt((prev) => (prev && prev > target ? prev : target));
+          // The gate loop at the top of the while() performs the actual wait.
+          continue; // does NOT consume a generic attempt, and has no retry cap
+        }
+        if (attempt >= MAX_ATTEMPTS - 1) return { rowIndex: index, success: false, data: {}, error: (err as Error).message };
         await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        attempt++;
       }
     }
-    return { rowIndex: index, success: false, data: {}, error: "Max retries" };
-  }, [inputColumns, outputColumns, enrichmentDescription, advancedMode, customPrompt, provider, apiKey, modelId, useWebSearch]);
+  }, [inputColumns, outputColumns, enrichmentDescription, advancedMode, customPrompt, provider, apiKey, azureEndpoint, azureDeployment, modelId, useWebSearch]);
 
   const runTest = async () => {
     if (!file) return;
     setTestRunning(true); setTestResults([]); setTestDone(false); setRealCostEstimate(null);
+    setRateLimitResetAt(null); rateLimitGateRef.current = 0; rlBackoffRef.current = 0;
     const rows = file.rows.slice(0, 3);
     const results: EnrichmentResult[] = [];
     for (let i = 0; i < rows.length; i++) {
@@ -422,7 +648,12 @@ export default function ToolPage() {
     if (!file) return;
     setRestoredNotice(null);
     setFullRunning(true); setFullDone(false);
+    setServerPeak(0); setServerInFlight(0);
+    // Reset the server-side peak so this run's parallelism is measured fresh.
+    fetch("/api/enrich-stats", { method: "POST" }).catch(() => {});
     stopRef.current = false; pauseRef.current = false; setFullPaused(false);
+    setRateLimitResetAt(null); rateLimitGateRef.current = 0; rlBackoffRef.current = 0;
+    reqDurationsRef.current = []; setEtaSeconds(null); setTpmEstimate(null);
 
     // Pre-populate from existing results when resuming, so already-enriched rows are skipped.
     const all: EnrichmentResult[] = new Array(file.rows.length);
@@ -440,9 +671,17 @@ export default function ToolPage() {
     setFullCompleted(done); setFullFailed(fail);
 
     let nextIdx = 0;
+    let activeWorkers = 0; // live count of running workers, for dynamic pool sizing
     const worker = async () => {
+      activeWorkers++;
+      setLiveWorkers(activeWorkers);
+      try {
       while (nextIdx < file.rows.length) {
         if (stopRef.current) return;
+        // Live concurrency: if the user dialed the worker count DOWN, surplus
+        // workers retire here (after finishing their current row) until the pool
+        // matches the target. The supervisor below tops it back up when raised.
+        if (activeWorkers > Math.max(1, concurrencyRef.current)) return;
         while (pauseRef.current) { await new Promise((r) => setTimeout(r, 200)); if (stopRef.current) return; }
         const idx = nextIdx++;
         if (idx >= file.rows.length) return;
@@ -451,10 +690,44 @@ export default function ToolPage() {
         all[idx] = r;
         r.success ? done++ : fail++;
         setFullCompleted(done); setFullFailed(fail); setFullResults([...all.filter(Boolean)]);
+        // ETA and the suggested Azure TPM are computed reactively by the ETA ticker
+        // effect (recomputes on an interval + on concurrency/progress change), so
+        // they aren't derived here.
+        // Refine the cost estimate live from REAL token counts across every enriched
+        // row so far (far more accurate than the 3-row test). The Azure TPM figure
+        // is computed in the ETA ticker effect instead, so it tracks the applied
+        // concurrency live rather than only updating when a row finishes here.
+        const enriched = all.filter((x) => x?.success && x.inputTokens && x.outputTokens);
+        if (enriched.length >= 3) {
+          const avgIn = Math.round(enriched.reduce((s, x) => s + (x.inputTokens || 0), 0) / enriched.length);
+          const avgOut = Math.round(enriched.reduce((s, x) => s + (x.outputTokens || 0), 0) / enriched.length);
+          setRealCostEstimate(calculateCostFromActualTokens(file.totalRows, avgIn, avgOut, provider, modelId, useWebSearch));
+        }
+      }
+      } finally {
+        activeWorkers--;
+        setLiveWorkers(activeWorkers);
       }
     };
-    await Promise.all(Array.from({ length: 3 }, () => worker()));
-    setFullRunning(false); setFullDone(true);
+    // Dynamic worker pool. Workers coordinate through the shared rate-limit gate
+    // (see enrichSingleRow): a 429 from any worker pauses the whole fleet, so
+    // concurrency gives throughput without lockstep re-tripping the limit.
+    // A supervisor keeps the pool sized to `concurrencyRef` LIVE: it spawns new
+    // workers when the user dials the count up; workers self-retire when dialed
+    // down (see the guard at the top of worker()). This lets the user tune
+    // concurrency mid-run without restarting the batch.
+    const pool: Promise<void>[] = [];
+    while (nextIdx < file.rows.length && !stopRef.current) {
+      const target = Math.min(MAX_CONCURRENCY, Math.max(1, concurrencyRef.current));
+      while (activeWorkers < target && nextIdx < file.rows.length) {
+        pool.push(worker());
+      }
+      // Poll periodically to react to concurrency changes and to detect completion.
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    await Promise.all(pool);
+    setLiveWorkers(0);
+    setFullRunning(false); setFullDone(true); setRateLimitResetAt(null); setEtaSeconds(null);
   };
 
   const handleDownload = () => {
@@ -473,7 +746,7 @@ export default function ToolPage() {
     document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
   };
 
-  const providerPricingUrl = provider === "anthropic" ? ANTHROPIC_PRICING_URL : provider === "grok" ? GROK_PRICING_URL : provider === "openai" ? OPENAI_PRICING_URL : provider === "vertex" ? VERTEX_PRICING_URL : GEMINI_PRICING_URL;
+  const providerPricingUrl = provider === "anthropic" ? ANTHROPIC_PRICING_URL : provider === "grok" ? GROK_PRICING_URL : provider === "openai" ? OPENAI_PRICING_URL : provider === "azure" ? AZURE_PRICING_URL : provider === "vertex" ? VERTEX_PRICING_URL : GEMINI_PRICING_URL;
 
   /* ---- render ---- */
   return (
@@ -730,6 +1003,7 @@ export default function ToolPage() {
                   { p: "gemini" as Provider, label: "Gemini", model: "gemini-3.1-pro-preview" as ModelId },
                   { p: "vertex" as Provider, label: "Vertex AI", model: "gemini-3.1-pro-preview" as ModelId },
                   { p: "openai" as Provider, label: "OpenAI", model: "gpt-5.4-mini" as ModelId },
+                  { p: "azure" as Provider, label: "Azure OpenAI", model: "gpt-5.4-mini" as ModelId },
                   { p: "anthropic" as Provider, label: "Claude", model: "claude-sonnet-4-5-20250929" as ModelId },
                   { p: "grok" as Provider, label: "Grok", model: "grok-4-0320" as ModelId },
                 ] as const).map(({ p, label, model }) => (
@@ -770,6 +1044,9 @@ export default function ToolPage() {
                 })}
               </div>
               <p className="mt-3 text-[11px] text-zinc-400">Not sure? The recommended model is a great default for most tasks.</p>
+              {provider === "azure" && (
+                <p className="mt-1.5 text-[11px] text-blue-600">Azure routes by your deployment name, not the model. Pick the model that matches your deployment — this drives cost estimates only.</p>
+              )}
 
               {/* Web search toggle */}
               <div className="mt-4 border-t border-zinc-200 pt-3">
@@ -790,7 +1067,7 @@ export default function ToolPage() {
             <Card className={!configReady ? "opacity-30 pointer-events-none" : ""} glow={!!configReady && !keyValid}>
               <StepHeader
                 num={4}
-                title={`Connect your ${provider === "anthropic" ? "Anthropic" : provider === "grok" ? "xAI" : provider === "openai" ? "OpenAI" : provider === "vertex" ? "Vertex AI" : "Google"} API key`}
+                title={`Connect your ${provider === "anthropic" ? "Anthropic" : provider === "grok" ? "xAI" : provider === "openai" ? "OpenAI" : provider === "azure" ? "Azure OpenAI" : provider === "vertex" ? "Vertex AI" : "Google"} API key`}
                 subtitle="Your key is never stored — it stays in browser memory only"
                 done={keyValid}
                 active={!!configReady && !keyValid}
@@ -798,6 +1075,19 @@ export default function ToolPage() {
 
               {!keyValid ? (
                 <div className="space-y-3">
+                  {provider === "azure" && (
+                    <>
+                      <input type="text" value={azureEndpoint} onChange={(e) => { setAzureEndpoint(e.target.value); setKeyError(""); }}
+                        placeholder="https://your-resource.openai.azure.com (or paste the full Responses URL)"
+                        className="w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-1 focus:ring-zinc-300 focus:outline-none"
+                      />
+                      <p className="text-[11px] text-zinc-400">Paste your base resource URL, or the full <code className="rounded bg-zinc-100 px-1">.../responses?api-version=...</code> URL from the Azure portal — either works.</p>
+                      <input type="text" value={azureDeployment} onChange={(e) => { setAzureDeployment(e.target.value); setKeyError(""); }}
+                        placeholder="Deployment name (e.g. my-gpt-4o)"
+                        className="w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-1 focus:ring-zinc-300 focus:outline-none"
+                      />
+                    </>
+                  )}
                   {provider === "vertex" ? (
                     <textarea value={apiKey} onChange={(e) => { setApiKey(e.target.value); setKeyError(""); }}
                       placeholder={'Paste your service account JSON here:\n{"type": "service_account", "project_id": "...", ...}'}
@@ -806,7 +1096,7 @@ export default function ToolPage() {
                     />
                   ) : (
                     <input type="password" value={apiKey} onChange={(e) => { setApiKey(e.target.value); setKeyError(""); }}
-                      placeholder={provider === "anthropic" ? "sk-ant-..." : provider === "grok" ? "xai-..." : provider === "openai" ? "sk-..." : "AIza..."}
+                      placeholder={provider === "anthropic" ? "sk-ant-..." : provider === "grok" ? "xai-..." : provider === "openai" ? "sk-..." : provider === "azure" ? "Azure API key" : "AIza..."}
                       className="w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-1 focus:ring-zinc-300 focus:outline-none"
                     />
                   )}
@@ -821,6 +1111,7 @@ export default function ToolPage() {
                     {provider === "vertex" && <a href="https://console.cloud.google.com/iam-admin/serviceaccounts" target="_blank" rel="noopener noreferrer" className="text-zinc-600 underline hover:text-zinc-900">Create a service account in Google Cloud</a>}
                     {provider === "openai" && <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer" className="text-zinc-600 underline hover:text-zinc-900">Get a key from OpenAI</a>}
                     {provider === "grok" && <a href="https://console.x.ai" target="_blank" rel="noopener noreferrer" className="text-zinc-600 underline hover:text-zinc-900">Get a key from xAI Console</a>}
+                    {provider === "azure" && <a href="https://portal.azure.com" target="_blank" rel="noopener noreferrer" className="text-zinc-600 underline hover:text-zinc-900">Find your endpoint, deployment & key in the Azure portal</a>}
                   </p>
                   <TrustBadge text="Your API key is never stored, logged, or sent to our servers. It goes directly from your browser to the AI provider." />
                 </div>
@@ -828,7 +1119,7 @@ export default function ToolPage() {
                 <div className="space-y-2">
                   <div className="flex items-center justify-between rounded-lg bg-emerald-50 px-3 py-2 ring-1 ring-emerald-200">
                     <span className="text-xs font-medium text-emerald-700">
-                      {provider === "anthropic" ? "Anthropic" : provider === "grok" ? "Grok" : provider === "openai" ? "OpenAI" : provider === "vertex" ? "Vertex AI" : "Gemini"} connected
+                      {provider === "anthropic" ? "Anthropic" : provider === "grok" ? "Grok" : provider === "openai" ? "OpenAI" : provider === "azure" ? "Azure OpenAI" : provider === "vertex" ? "Vertex AI" : "Gemini"} connected
                     </span>
                     <button onClick={() => { setKeyValid(false); setApiKey(""); setKeyWarning(""); }} className="text-xs text-red-500 hover:text-red-700">Disconnect</button>
                   </div>
@@ -912,12 +1203,25 @@ export default function ToolPage() {
               {(fullRunning || fullDone || hasPartialRun) && (
                 <div className="mt-4 space-y-3 border-t border-zinc-200 pt-4">
                   <div className="flex items-center justify-between text-xs text-zinc-500">
-                    <span>{fullCompleted + fullFailed} / {file?.totalRows} processed</span>
-                    <span className="tabular-nums">{fullCompleted} OK &middot; {fullFailed} failed</span>
+                    <span>
+                      {fullCompleted + fullFailed} / {file?.totalRows} processed
+                      {fullRunning && etaSeconds != null && (
+                        <span className="ml-2 text-zinc-400">· ~{formatEta(etaSeconds)} left</span>
+                      )}
+                    </span>
+                    <span className="tabular-nums">{fullCompleted} OK{fullPartial > 0 ? ` · ${fullPartial} with N/A` : ""} &middot; {fullFailed} failed</span>
                   </div>
                   <div className="h-2 overflow-hidden rounded-full bg-zinc-100">
                     <div className={`h-full rounded-full transition-all ${fullDone ? "bg-emerald-500" : "bg-zinc-900"}`} style={{ width: `${((fullCompleted + fullFailed) / (file?.totalRows || 1)) * 100}%` }} />
                   </div>
+
+                  {/* Rate-limit backoff notice with live countdown */}
+                  {fullRunning && rlCountdown > 0 && (
+                    <div className="flex items-center gap-2 rounded-lg bg-amber-50 px-3 py-2 ring-1 ring-amber-200">
+                      <svg className="h-3.5 w-3.5 shrink-0 animate-spin text-amber-500" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                      <span className="text-[11px] text-amber-700">Rate limited by Azure — backing off, retrying in <span className="font-semibold tabular-nums">{rlCountdown}s</span>. Already-enriched rows are kept.</span>
+                    </div>
+                  )}
 
                   {/* Results table preview */}
                   {fullResults.length > 0 && (
@@ -1003,11 +1307,15 @@ export default function ToolPage() {
                     <div className="space-y-3">
                       <div className="rounded-lg bg-emerald-50 px-4 py-3 ring-1 ring-emerald-200">
                         <p className="text-sm font-semibold text-emerald-800">Enrichment complete</p>
-                        <p className="mt-0.5 text-xs text-emerald-600">{fullCompleted} rows enriched{fullFailed > 0 ? `, ${fullFailed} failed` : ""}. {outputColumns.length} new columns added.</p>
+                        <p className="mt-0.5 text-xs text-emerald-600">{fullCompleted} rows enriched{fullPartial > 0 ? ` (${fullPartial} with N/A values)` : ""}{fullFailed > 0 ? `, ${fullFailed} failed` : ""}. {outputColumns.length} new columns added.</p>
                       </div>
                       <button onClick={handleDownload}
                         className="w-full rounded-lg bg-emerald-600 py-3 text-sm font-semibold text-white transition hover:bg-emerald-500">
                         Download Enriched File
+                      </button>
+                      <button onClick={resetRun}
+                        className="w-full rounded-lg border border-zinc-200 py-2.5 text-xs font-medium text-zinc-600 transition hover:bg-zinc-50">
+                        Reset run — keep my setup
                       </button>
                     </div>
                   )}
@@ -1027,57 +1335,217 @@ export default function ToolPage() {
 
               {/* Estimate sidebar */}
               <Card>
-                <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-zinc-400">
-                  {realCostEstimate ? "Precise Estimate" : "Estimate"}
-                </h3>
+                {(realCostEstimate || costRange) ? (
+                  <button
+                    onClick={() => setEstimateCollapsed((v) => !v)}
+                    className="mb-3 flex w-full items-center justify-between text-left"
+                    aria-expanded={!estimateCollapsed}
+                  >
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">
+                      {realCostEstimate ? "Precise Estimate" : "Estimate"}
+                    </h3>
+                    <svg className={`h-4 w-4 text-zinc-400 transition-transform ${estimateCollapsed ? "" : "rotate-180"}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" /></svg>
+                  </button>
+                ) : (
+                  <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-zinc-400">Estimate</h3>
+                )}
                 {realCostEstimate ? (
                   <div className="space-y-3">
-                    {/* Total — hero treatment */}
+                    {/* Total — hero treatment (always visible) */}
                     <div className="rounded-xl bg-zinc-50 px-4 py-3 text-center ring-1 ring-zinc-100">
                       <span className="block text-[10px] font-medium uppercase tracking-wider text-zinc-400">Estimated Total</span>
                       <span className="text-2xl font-bold text-zinc-900">~${realCostEstimate.totalCost.toFixed(2)}</span>
                     </div>
-                    <div className="space-y-1.5 text-xs">
-                      <div className="flex justify-between"><span className="text-zinc-400">Rows</span><span className="font-medium text-zinc-700">{realCostEstimate.totalRows.toLocaleString()}</span></div>
-                      <div className="flex justify-between"><span className="text-zinc-400">Model</span><span className="font-medium text-zinc-700">{realCostEstimate.modelName}</span></div>
-                      <div className="flex justify-between"><span className="text-zinc-400">New columns</span><span className="font-medium text-zinc-700">{outputColumns.length}</span></div>
-                    </div>
-                    <div className="border-t border-zinc-100 pt-2.5 space-y-1.5 text-xs">
-                      <div className="flex justify-between"><span className="text-zinc-400">Platform fee</span><span className="font-semibold text-emerald-600">Free</span></div>
-                      <div className="flex justify-between"><span className="text-zinc-400">Input tokens</span><span className="text-zinc-600">${realCostEstimate.inputCost.toFixed(2)}</span></div>
-                      <div className="flex justify-between"><span className="text-zinc-400">Output tokens</span><span className="text-zinc-600">${realCostEstimate.outputCost.toFixed(2)}</span></div>
-                      {realCostEstimate.searchCost > 0 && (
-                        <div className="flex justify-between"><span className="text-zinc-400">Web search</span><span className="text-zinc-600">${realCostEstimate.searchCost.toFixed(2)}</span></div>
-                      )}
-                    </div>
-                    {realCostEstimate.freeSearchNote && <p className="text-[11px] text-emerald-600">{realCostEstimate.freeSearchNote}</p>}
-                    <p className="text-center text-[10px] text-emerald-600">Based on your test run</p>
+                    {!estimateCollapsed && (
+                      <>
+                        <div className="space-y-1.5 text-xs">
+                          <div className="flex justify-between"><span className="text-zinc-400">Rows</span><span className="font-medium text-zinc-700">{realCostEstimate.totalRows.toLocaleString()}</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Model</span><span className="font-medium text-zinc-700">{realCostEstimate.modelName}</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">New columns</span><span className="font-medium text-zinc-700">{outputColumns.length}</span></div>
+                        </div>
+                        <div className="border-t border-zinc-100 pt-2.5 space-y-1.5 text-xs">
+                          <div className="flex justify-between"><span className="text-zinc-400">Input tokens</span><span className="font-medium text-zinc-700">{realCostEstimate.totalInputTokens.toLocaleString()}</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Output tokens</span><span className="font-medium text-zinc-700">{realCostEstimate.totalOutputTokens.toLocaleString()}</span></div>
+                        </div>
+                        {provider === "azure" && tpmEstimate != null && (
+                          <div className="rounded-lg bg-amber-50 px-3 py-2 ring-1 ring-amber-200">
+                            <div className="flex justify-between text-xs"><span className="font-medium text-amber-700">Suggested Azure TPM</span><span className="font-semibold tabular-nums text-amber-800">≥ {tpmEstimate.toLocaleString()}</span></div>
+                            <p className="mt-0.5 text-[10px] text-amber-600">To run {concurrency} row{concurrency !== 1 ? "s" : ""} at once without throttling. Set your deployment&apos;s tokens-per-minute at or above this.</p>
+                          </div>
+                        )}
+                        <div className="border-t border-zinc-100 pt-2.5 space-y-1.5 text-xs">
+                          <div className="flex justify-between"><span className="text-zinc-400">Platform fee</span><span className="font-semibold text-emerald-600">Free</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Input cost</span><span className="text-zinc-600">${realCostEstimate.inputCost.toFixed(2)}</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Output cost</span><span className="text-zinc-600">${realCostEstimate.outputCost.toFixed(2)}</span></div>
+                          {realCostEstimate.searchCost > 0 && (
+                            <div className="flex justify-between"><span className="text-zinc-400">Web search</span><span className="text-zinc-600">${realCostEstimate.searchCost.toFixed(2)}</span></div>
+                          )}
+                        </div>
+                        {realCostEstimate.freeSearchNote && <p className="text-[11px] text-emerald-600">{realCostEstimate.freeSearchNote}</p>}
+                        <p className="text-center text-[10px] text-emerald-600">{fullResults.length >= 3 ? `Refined from ${fullResults.filter((r) => r.success).length} enriched rows` : "Based on your test run"}</p>
+                      </>
+                    )}
                   </div>
                 ) : costRange ? (
                   <div className="space-y-3">
-                    {/* Total range — hero treatment */}
+                    {/* Total range — hero treatment (always visible) */}
                     <div className="rounded-xl bg-zinc-50 px-4 py-3 text-center ring-1 ring-zinc-100">
                       <span className="block text-[10px] font-medium uppercase tracking-wider text-zinc-400">Estimated Range</span>
                       <span className="text-2xl font-bold text-zinc-900">${costRange.low.totalCost.toFixed(2)} – ${costRange.high.totalCost.toFixed(2)}</span>
                     </div>
-                    <div className="space-y-1.5 text-xs">
-                      <div className="flex justify-between"><span className="text-zinc-400">Rows</span><span className="font-medium text-zinc-700">{costRange.low.totalRows.toLocaleString()}</span></div>
-                      <div className="flex justify-between"><span className="text-zinc-400">Model</span><span className="font-medium text-zinc-700">{costRange.low.modelName}</span></div>
-                      <div className="flex justify-between"><span className="text-zinc-400">New columns</span><span className="font-medium text-zinc-700">{outputColumns.length}</span></div>
-                    </div>
-                    <div className="border-t border-zinc-100 pt-2.5 space-y-1.5 text-xs">
-                      <div className="flex justify-between"><span className="text-zinc-400">Platform fee</span><span className="font-semibold text-emerald-600">Free</span></div>
-                      <div className="flex justify-between"><span className="text-zinc-400">Input tokens</span><span className="text-zinc-600">${costRange.low.inputCost.toFixed(2)} – ${costRange.high.inputCost.toFixed(2)}</span></div>
-                      <div className="flex justify-between"><span className="text-zinc-400">Output tokens</span><span className="text-zinc-600">${costRange.low.outputCost.toFixed(2)}</span></div>
-                      {costRange.high.searchCost > 0 && (
-                        <div className="flex justify-between"><span className="text-zinc-400">Web search</span><span className="text-zinc-600">${costRange.low.searchCost.toFixed(2)}</span></div>
-                      )}
-                    </div>
-                    {costRange.low.freeSearchNote && <p className="text-[11px] text-emerald-600">{costRange.low.freeSearchNote}</p>}
-                    <p className="text-center text-[10px] text-amber-600">{useWebSearch ? "Run a test for a precise estimate" : "Estimate based on prompt tokens"}</p>
+                    {!estimateCollapsed && (
+                      <>
+                        <div className="space-y-1.5 text-xs">
+                          <div className="flex justify-between"><span className="text-zinc-400">Rows</span><span className="font-medium text-zinc-700">{costRange.low.totalRows.toLocaleString()}</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Model</span><span className="font-medium text-zinc-700">{costRange.low.modelName}</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">New columns</span><span className="font-medium text-zinc-700">{outputColumns.length}</span></div>
+                        </div>
+                        <div className="border-t border-zinc-100 pt-2.5 space-y-1.5 text-xs">
+                          <div className="flex justify-between"><span className="text-zinc-400">Input tokens</span><span className="font-medium text-zinc-700">{costRange.low.totalInputTokens.toLocaleString()}{costRange.high.totalInputTokens !== costRange.low.totalInputTokens ? ` – ${costRange.high.totalInputTokens.toLocaleString()}` : ""}</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Output tokens</span><span className="font-medium text-zinc-700">{costRange.low.totalOutputTokens.toLocaleString()}</span></div>
+                        </div>
+                        <div className="border-t border-zinc-100 pt-2.5 space-y-1.5 text-xs">
+                          <div className="flex justify-between"><span className="text-zinc-400">Platform fee</span><span className="font-semibold text-emerald-600">Free</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Input cost</span><span className="text-zinc-600">${costRange.low.inputCost.toFixed(2)} – ${costRange.high.inputCost.toFixed(2)}</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Output cost</span><span className="text-zinc-600">${costRange.low.outputCost.toFixed(2)}</span></div>
+                          {costRange.high.searchCost > 0 && (
+                            <div className="flex justify-between"><span className="text-zinc-400">Web search</span><span className="text-zinc-600">${costRange.low.searchCost.toFixed(2)}</span></div>
+                          )}
+                        </div>
+                        {costRange.low.freeSearchNote && <p className="text-[11px] text-emerald-600">{costRange.low.freeSearchNote}</p>}
+                        <p className="text-center text-[10px] text-amber-600">{useWebSearch ? "Run a test for a precise estimate" : "Estimate based on prompt tokens"}</p>
+                      </>
+                    )}
                   </div>
                 ) : (
                   <p className="text-xs text-zinc-400">Upload a file and describe your enrichment to see an estimate.</p>
+                )}
+              </Card>
+
+              {/* Live cost incurred — real money spent so far, from actual tokens */}
+              {liveCost && (
+                <Card>
+                  <button
+                    onClick={() => setLiveCostCollapsed((v) => !v)}
+                    className="mb-3 flex w-full items-center justify-between text-left"
+                    aria-expanded={!liveCostCollapsed}
+                  >
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">Cost so far</h3>
+                    <div className="flex items-center gap-2">
+                      {fullRunning && (
+                        <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-600">
+                          <span className="relative flex h-1.5 w-1.5">
+                            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                            <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                          </span>
+                          Live
+                        </span>
+                      )}
+                      <svg className={`h-4 w-4 text-zinc-400 transition-transform ${liveCostCollapsed ? "" : "rotate-180"}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" /></svg>
+                    </div>
+                  </button>
+                  {/* Total — always visible */}
+                  <div className="rounded-xl bg-emerald-50 px-4 py-3 text-center ring-1 ring-emerald-100">
+                    <span className="block text-[10px] font-medium uppercase tracking-wider text-emerald-500">Actually Incurred</span>
+                    <span className="text-2xl font-bold text-emerald-700">${liveCost.totalCost.toFixed(liveCost.totalCost < 1 ? 4 : 2)}</span>
+                  </div>
+                  {!liveCostCollapsed && (
+                    <>
+                      <div className="mt-3 space-y-1.5 text-xs">
+                        <div className="flex justify-between"><span className="text-zinc-400">Rows charged</span><span className="font-medium text-zinc-700">{liveCost.rowsRun.toLocaleString()}</span></div>
+                        <div className="flex justify-between"><span className="text-zinc-400">Input tokens</span><span className="font-medium text-zinc-700">{liveCost.totalInputTokens.toLocaleString()}</span></div>
+                        <div className="flex justify-between"><span className="text-zinc-400">Output tokens</span><span className="font-medium text-zinc-700">{liveCost.totalOutputTokens.toLocaleString()}</span></div>
+                      </div>
+                      <div className="mt-2.5 border-t border-zinc-100 pt-2.5 space-y-1.5 text-xs">
+                        <div className="flex justify-between"><span className="text-zinc-400">Input cost</span><span className="text-zinc-600">${liveCost.inputCost.toFixed(4)}</span></div>
+                        <div className="flex justify-between"><span className="text-zinc-400">Output cost</span><span className="text-zinc-600">${liveCost.outputCost.toFixed(4)}</span></div>
+                        {liveCost.searchCost > 0 && (
+                          <div className="flex justify-between"><span className="text-zinc-400">Web search</span><span className="text-zinc-600">${liveCost.searchCost.toFixed(4)}</span></div>
+                        )}
+                      </div>
+                      <p className="mt-2 text-center text-[10px] text-zinc-400">Billed to your own {liveCost.modelName} account.</p>
+                    </>
+                  )}
+                </Card>
+              )}
+
+              {/* Concurrency control — edit the slider, then press Apply to commit.
+                  Applies live, even mid-run: the worker pool resizes on the fly. */}
+              <Card>
+                <div className="mb-3 flex items-center justify-between">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">Concurrency</h3>
+                  <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-[11px] font-semibold tabular-nums text-zinc-700">{concurrency}</span>
+                </div>
+                <p className="mb-3 text-[11px] leading-relaxed text-zinc-500">
+                  How many rows are enriched at once. Higher is faster but more likely to hit your provider&apos;s rate limits.
+                </p>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => setConcurrency((c) => Math.max(1, c - 1))}
+                    disabled={concurrency <= 1}
+                    aria-label="Decrease concurrency"
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-zinc-200 text-zinc-600 transition hover:bg-zinc-50 disabled:opacity-30"
+                  >
+                    <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 12h-15" /></svg>
+                  </button>
+                  <input
+                    type="range"
+                    min={1}
+                    max={MAX_CONCURRENCY}
+                    value={concurrency}
+                    onChange={(e) => setConcurrency(Number(e.target.value))}
+                    className="h-1.5 flex-1 cursor-pointer appearance-none rounded-full bg-zinc-200 accent-zinc-900"
+                  />
+                  <button
+                    onClick={() => setConcurrency((c) => Math.min(MAX_CONCURRENCY, c + 1))}
+                    disabled={concurrency >= MAX_CONCURRENCY}
+                    aria-label="Increase concurrency"
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-zinc-200 text-zinc-600 transition hover:bg-zinc-50 disabled:opacity-30"
+                  >
+                    <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
+                  </button>
+                </div>
+                <div className="mt-1.5 flex justify-between text-[10px] text-zinc-400">
+                  <span>1 (gentle)</span>
+                  <span>{MAX_CONCURRENCY} (fastest)</span>
+                </div>
+
+                {/* Apply — commits the draft. Only then does it affect the run. */}
+                <button
+                  onClick={() => setAppliedConcurrency(concurrency)}
+                  disabled={concurrency === appliedConcurrency}
+                  className="mt-3 w-full rounded-lg bg-zinc-900 py-2 text-xs font-semibold text-white transition hover:bg-zinc-800 disabled:cursor-default disabled:bg-zinc-100 disabled:text-zinc-400"
+                >
+                  {concurrency === appliedConcurrency
+                    ? `Active: ${appliedConcurrency} at a time`
+                    : `Apply — ${concurrency} at a time`}
+                </button>
+
+                {/* Live readout: how many workers are ACTUALLY running right now.
+                    If this sits below the applied count, the fleet is being held by
+                    a rate-limit backoff, not by the pool size. */}
+                {fullRunning && (
+                  <div className="mt-2 space-y-1 rounded-lg bg-zinc-50 px-3 py-2 text-[11px] ring-1 ring-zinc-100">
+                    <div className="flex items-center justify-between">
+                      <span className="text-zinc-500">Workers spawned</span>
+                      <span className="font-semibold tabular-nums text-zinc-700">
+                        {liveWorkers} / {appliedConcurrency}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-zinc-500" title="Requests the backend is actually handling right now (measured on the server, not the browser).">Reaching server now</span>
+                      <span className="font-semibold tabular-nums text-zinc-700">{serverInFlight}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-zinc-500" title="Highest number of requests the server processed simultaneously this run.">Peak parallel (server)</span>
+                      <span className={`font-semibold tabular-nums ${serverPeak <= 6 && appliedConcurrency > 6 ? "text-amber-600" : "text-emerald-600"}`}>{serverPeak}</span>
+                    </div>
+                    {serverPeak <= 6 && appliedConcurrency > 6 && liveWorkers > 6 && (
+                      <p className="pt-1 text-[10px] leading-tight text-amber-600">
+                        Peak stuck at ≤6 → the browser is capping connections (HTTP/1.1). Use <code className="rounded bg-amber-100 px-1">npm run dev:h2</code> and open the https://localhost:3443 URL.
+                      </p>
+                    )}
+                  </div>
                 )}
               </Card>
 
